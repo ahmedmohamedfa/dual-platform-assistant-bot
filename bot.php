@@ -68,6 +68,10 @@ if (!function_exists('str_starts_with')) {
     }
 }
 
+// ==================================================================
+// 2. WEBHOOK SETUP & ROUTING / توجيه الـ Webhook
+// ==================================================================
+
 function detectPlatform(): string
 {
     $queryPlatform = strtolower(trim($_GET['platform'] ?? ''));
@@ -99,6 +103,10 @@ function respond200(string $body = 'OK'): void
     echo $body;
     flush();
 }
+
+// ==================================================================
+// 3. PLATFORM DETECTION (Telegram vs WhatsApp)
+// ==================================================================
 
 function readIncomingPayload(): ?array
 {
@@ -195,23 +203,27 @@ function parseMessage(array $payload, string $platform): ?array
     return null;
 }
 
+// ==================================================================
+// 5. SESSION & USER MANAGEMENT / إدارة الجلسات والمستخدمين
+// ==================================================================
+
 function loadDB(): array
 {
+    $empty = ['users' => [], 'sessions' => [], 'stats' => ['total_messages' => 0, 'total_sessions' => 0, 'active_sessions' => 0, 'broadcasts' => 0, 'banned_users' => []]];
     if (!file_exists(DB_FILE)) {
-        $empty = ['users' => [], 'sessions' => [], 'stats' => ['total_messages' => 0, 'total_sessions' => 0, 'active_sessions' => 0, 'broadcasts' => 0, 'banned_users' => []]];
         saveDB($empty);
         return $empty;
     }
     $json = file_get_contents(DB_FILE);
     if ($json === false || empty($json)) {
-        return ['users' => [], 'sessions' => [], 'stats' => ['total_messages' => 0, 'total_sessions' => 0, 'active_sessions' => 0, 'broadcasts' => 0, 'banned_users' => []]];
+        return $empty;
     }
     $data = json_decode($json, true);
     if (!is_array($data)) {
-        return ['users' => [], 'sessions' => [], 'stats' => ['total_messages' => 0, 'total_sessions' => 0, 'active_sessions' => 0, 'broadcasts' => 0, 'banned_users' => []]];
+        return $empty;
     }
     if (!isset($data['stats'])) {
-        $data['stats'] = ['total_messages' => 0, 'total_sessions' => 0, 'active_sessions' => 0, 'broadcasts' => 0, 'banned_users' => []];
+        $data['stats'] = $empty['stats'];
     }
     if (!isset($data['stats']['banned_users'])) {
         $data['stats']['banned_users'] = [];
@@ -222,9 +234,13 @@ function loadDB(): array
 function saveDB(array $db): bool
 {
     $json = json_encode($db, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-    if ($json === false) { return false; }
+    if ($json === false) {
+        return false;
+    }
     $fp = fopen(DB_FILE, 'c');
-    if ($fp === false) { return false; }
+    if ($fp === false) {
+        return false;
+    }
     if (flock($fp, LOCK_EX)) {
         ftruncate($fp, 0);
         rewind($fp);
@@ -294,11 +310,17 @@ function countActiveSessions(array $db): int
     $threshold = date('Y-m-d H:i:s', strtotime('-24 hours'));
     foreach ($db['sessions'] as $session) {
         if (isset($session['updated_at']) && $session['updated_at'] >= $threshold) {
-            if ($session['state'] !== 'idle') { $count++; }
+            if ($session['state'] !== 'idle') {
+                $count++;
+            }
         }
     }
     return $count;
 }
+
+// ==================================================================
+// 6. COMMAND HANDLERS / معالجات الأوامر
+// ==================================================================
 
 function handleCommand(array $msg, array &$db): ?string
 {
@@ -306,17 +328,34 @@ function handleCommand(array $msg, array &$db): ?string
     $userId = $msg['user_id'];
     $platform = $msg['platform'];
     $session = getSession($db, $userId);
+
+    // Handle callback data (inline button presses) — before conversation state,
+    // so button presses always work even during an active multi-step conversation
+    if (!empty($msg['is_callback'])) {
+        return handleCallback($msg, $db);
+    }
+
+    // Handle multi-step conversation states
     if ($session['state'] !== 'idle' && $session['state'] !== '') {
         $stateResponse = handleConversationState($msg, $db, $session);
-        if ($stateResponse !== null) { return $stateResponse; }
+        if ($stateResponse !== null) {
+            return $stateResponse;
+        }
     }
+
     if ($text === '') {
         return getFormattedMessage($platform, '⚠️ لم أتمكن من قراءة رسالتك. يرجى إرسال نص.');
     }
-    if (str_starts_with($text, '/')) { return handleSlashCommand($msg, $db); }
-    if (!empty($msg['is_callback'])) { return handleCallback($msg, $db); }
+
+    if (str_starts_with($text, '/')) {
+        return handleSlashCommand($msg, $db);
+    }
+
     $intent = detectIntent($text);
-    if ($intent !== null) { return handleIntent($intent, $msg, $db); }
+    if ($intent !== null) {
+        return handleIntent($intent, $msg, $db);
+    }
+
     return getFormattedMessage($platform, getFallbackMessage($msg));
 }
 
@@ -328,22 +367,49 @@ function handleSlashCommand(array $msg, array &$db): string
     $args = array_slice($parts, 1);
     $userId = $msg['user_id'];
     $platform = $msg['platform'];
+
     switch ($command) {
-        case '/start': clearSession($db, $userId); return buildWelcomeMessage($msg);
-        case '/help': return buildHelpMessage($platform);
-        case '/about': return buildAboutMessage($platform);
-        case '/settings': setSession($db, $userId, 'settings_menu', [], $msg); return buildSettingsMessage($platform);
-        case '/feedback': setSession($db, $userId, 'awaiting_feedback', [], $msg); return getFormattedMessage($platform, "📝 يرجى كتابة ملاحظاتك أو اقتراحاتك وسأرسلها للمشرف.\n\nاكتب /cancel للإلغاء.");
-        case '/cancel': clearSession($db, $userId); return getFormattedMessage($platform, "✅ تم إلغاء العملية الحالية.\n\n" . buildMainMenuText($platform));
-        case '/menu': return getFormattedMessage($platform, buildMainMenuText($platform));
-        case '/admin': if (isAdmin($userId)) { return buildAdminPanel($platform); } return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
-        case '/stats': if (isAdmin($userId)) { return buildStatsMessage($db, $platform); } return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
-        case '/broadcast': if (isAdmin($userId)) { setSession($db, $userId, 'awaiting_broadcast', [], $msg); return getFormattedMessage($platform, "📢 أرسل الرسالة التي تريد بثها لجميع المستخدمين:\n\nاكتب /cancel للإلغاء."); } return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
-        case '/ban': if (isAdmin($userId)) { $targetId = trim($args[0] ?? ''); if ($targetId === '') { return getFormattedMessage($platform, "⚠️ الاستخدام: /ban [user_id]"); } return banUser($db, $targetId, $platform); } return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
-        case '/unban': if (isAdmin($userId)) { $targetId = trim($args[0] ?? ''); if ($targetId === '') { return getFormattedMessage($platform, "⚠️ الاستخدام: /unban [user_id]"); } return unbanUser($db, $targetId, $platform); } return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
-        case '/logs': if (isAdmin($userId)) { return buildLogsMessage($platform); } return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
-        case '/users': if (isAdmin($userId)) { return buildUsersListMessage($db, $platform); } return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
-        default: return getFormattedMessage($platform, "❓ أمر غير معروف: {$command}\n\nاكتب /help لعرض جميع الأوامر المتاحة.");
+        case '/start':
+            clearSession($db, $userId);
+            return buildWelcomeMessage($msg);
+        case '/help':
+            return buildHelpMessage($platform);
+        case '/about':
+            return buildAboutMessage($platform);
+        case '/settings':
+            setSession($db, $userId, 'settings_menu', [], $msg);
+            return buildSettingsMessage($platform);
+        case '/feedback':
+            setSession($db, $userId, 'awaiting_feedback', [], $msg);
+            return getFormattedMessage($platform, "📝 يرجى كتابة ملاحظاتك أو اقتراحاتك وسأرسلها للمشرف.\n\nاكتب /cancel للإلغاء.");
+        case '/cancel':
+            clearSession($db, $userId);
+            return getFormattedMessage($platform, "✅ تم إلغاء العملية الحالية.\n\n" . buildMainMenuText($platform));
+        case '/menu':
+            return getFormattedMessage($platform, buildMainMenuText($platform));
+        case '/admin':
+            if (isAdmin($userId)) { return buildAdminPanel($platform); }
+            return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
+        case '/stats':
+            if (isAdmin($userId)) { return buildStatsMessage($db, $platform); }
+            return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
+        case '/broadcast':
+            if (isAdmin($userId)) { setSession($db, $userId, 'awaiting_broadcast', [], $msg); return getFormattedMessage($platform, "📢 أرسل الرسالة التي تريد بثها لجميع المستخدمين:\n\nاكتب /cancel للإلغاء."); }
+            return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
+        case '/ban':
+            if (isAdmin($userId)) { $targetId = trim($args[0] ?? ''); if ($targetId === '') { return getFormattedMessage($platform, "⚠️ الاستخدام: /ban [user_id]"); } return banUser($db, $targetId, $platform); }
+            return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
+        case '/unban':
+            if (isAdmin($userId)) { $targetId = trim($args[0] ?? ''); if ($targetId === '') { return getFormattedMessage($platform, "⚠️ الاستخدام: /unban [user_id]"); } return unbanUser($db, $targetId, $platform); }
+            return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
+        case '/logs':
+            if (isAdmin($userId)) { return buildLogsMessage($platform); }
+            return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
+        case '/users':
+            if (isAdmin($userId)) { return buildUsersListMessage($db, $platform); }
+            return getFormattedMessage($platform, "⛔ هذا الأمر مخصص للمشرفين فقط.");
+        default:
+            return getFormattedMessage($platform, "❓ أمر غير معروف: {$command}\n\nاكتب /help لعرض جميع الأوامر المتاحة.");
     }
 }
 
@@ -352,24 +418,52 @@ function handleCallback(array $msg, array &$db): ?string
     $data = $msg['text'] ?? '';
     $userId = $msg['user_id'];
     $platform = $msg['platform'];
-    if ($platform === 'telegram' && !empty($msg['callback_id'])) { answerCallbackQuery($msg['callback_id']); }
+
+    if ($platform === 'telegram' && !empty($msg['callback_id'])) {
+        answerCallbackQuery($msg['callback_id']);
+    }
+
     $callbackMap = [
-        'menu_start' => fn() => buildWelcomeMessage($msg),
-        'menu_help' => fn() => buildHelpMessage($platform),
-        'menu_about' => fn() => buildAboutMessage($platform),
-        'menu_settings' => function() use ($db, $userId, $msg, $platform) { setSession($db, $userId, 'settings_menu', [], $msg); return buildSettingsMessage($platform); },
-        'menu_feedback' => function() use ($db, $userId, $msg, $platform) { setSession($db, $userId, 'awaiting_feedback', [], $msg); return getFormattedMessage($platform, "📝 يرجى كتابة ملاحظاتك أو اقتراحاتك وسأرسلها للمشرف.\n\nاكتب /cancel للإلغاء."); },
-        'menu_cancel' => function() use ($db, $userId, $platform) { clearSession($db, $userId); return getFormattedMessage($platform, "✅ تم إلغاء العملية.\n\n" . buildMainMenuText($platform)); },
-        'set_lang_ar' => function() use ($db, $userId, $platform) { if (isset($db['users'][$userId])) { $db['users'][$userId]['language'] = 'ar'; } return getFormattedMessage($platform, "✅ تم تعيين اللغة إلى العربية."); },
-        'set_lang_en' => function() use ($db, $userId, $platform) { if (isset($db['users'][$userId])) { $db['users'][$userId]['language'] = 'en'; } return getFormattedMessage($platform, "✅ Language set to English."); },
-        'set_notif_on' => function() use ($db, $userId, $platform) { if (isset($db['users'][$userId])) { $db['users'][$userId]['notifications'] = true; } return getFormattedMessage($platform, "✅ تم تفعيل الإشعارات."); },
-        'set_notif_off' => function() use ($db, $userId, $platform) { if (isset($db['users'][$userId])) { $db['users'][$userId]['notifications'] = false; } return getFormattedMessage($platform, "✅ تم إيقاف الإشعارات."); },
-        'admin_panel' => fn() => isAdmin($userId) ? buildAdminPanel($platform) : getFormattedMessage($platform, "⛔ غير مصرح."),
-        'admin_stats' => fn() => isAdmin($userId) ? buildStatsMessage($db, $platform) : getFormattedMessage($platform, "⛔ غير مصرح."),
-        'admin_users' => fn() => isAdmin($userId) ? buildUsersListMessage($db, $platform) : getFormattedMessage($platform, "⛔ غير مصرح."),
-        'admin_logs' => fn() => isAdmin($userId) ? buildLogsMessage($platform) : getFormattedMessage($platform, "⛔ غير مصرح."),
+        'menu_start'    => fn() => buildWelcomeMessage($msg),
+        'menu_help'     => fn() => buildHelpMessage($platform),
+        'menu_about'    => fn() => buildAboutMessage($platform),
+        'menu_settings' => function() use (&$db, $userId, $msg, $platform) {
+            setSession($db, $userId, 'settings_menu', [], $msg);
+            return buildSettingsMessage($platform);
+        },
+        'menu_feedback' => function() use (&$db, $userId, $msg, $platform) {
+            setSession($db, $userId, 'awaiting_feedback', [], $msg);
+            return getFormattedMessage($platform, "📝 يرجى كتابة ملاحظاتك أو اقتراحاتك وسأرسلها للمشرف.\n\nاكتب /cancel للإلغاء.");
+        },
+        'menu_cancel'   => function() use (&$db, $userId, $platform) {
+            clearSession($db, $userId);
+            return getFormattedMessage($platform, "✅ تم إلغاء العملية.\n\n" . buildMainMenuText($platform));
+        },
+        'set_lang_ar'   => function() use (&$db, $userId, $platform) {
+            if (isset($db['users'][$userId])) { $db['users'][$userId]['language'] = 'ar'; }
+            return getFormattedMessage($platform, "✅ تم تعيين اللغة إلى العربية.");
+        },
+        'set_lang_en'   => function() use (&$db, $userId, $platform) {
+            if (isset($db['users'][$userId])) { $db['users'][$userId]['language'] = 'en'; }
+            return getFormattedMessage($platform, "✅ Language set to English.");
+        },
+        'set_notif_on'  => function() use (&$db, $userId, $platform) {
+            if (isset($db['users'][$userId])) { $db['users'][$userId]['notifications'] = true; }
+            return getFormattedMessage($platform, "✅ تم تفعيل الإشعارات.");
+        },
+        'set_notif_off' => function() use (&$db, $userId, $platform) {
+            if (isset($db['users'][$userId])) { $db['users'][$userId]['notifications'] = false; }
+            return getFormattedMessage($platform, "✅ تم إيقاف الإشعارات.");
+        },
+        'admin_panel'   => fn() => isAdmin($userId) ? buildAdminPanel($platform) : getFormattedMessage($platform, "⛔ غير مصرح."),
+        'admin_stats'   => fn() => isAdmin($userId) ? buildStatsMessage($db, $platform) : getFormattedMessage($platform, "⛔ غير مصرح."),
+        'admin_users'   => fn() => isAdmin($userId) ? buildUsersListMessage($db, $platform) : getFormattedMessage($platform, "⛔ غير مصرح."),
+        'admin_logs'    => fn() => isAdmin($userId) ? buildLogsMessage($platform) : getFormattedMessage($platform, "⛔ غير مصرح."),
     ];
-    if (isset($callbackMap[$data])) { return $callbackMap[$data](); }
+
+    if (isset($callbackMap[$data])) {
+        return $callbackMap[$data]();
+    }
     return null;
 }
 
@@ -378,100 +472,225 @@ function handleConversationState(array $msg, array &$db, array $session): ?strin
     $text = trim($msg['text'] ?? '');
     $userId = $msg['user_id'];
     $platform = $msg['platform'];
-    if (strtolower($text) === '/cancel') { clearSession($db, $userId); return getFormattedMessage($platform, "✅ تم إلغاء العملية الحالية.\n\n" . buildMainMenuText($platform)); }
+
+    if (strtolower($text) === '/cancel') {
+        clearSession($db, $userId);
+        return getFormattedMessage($platform, "✅ تم إلغاء العملية الحالية.\n\n" . buildMainMenuText($platform));
+    }
+
     switch ($session['state']) {
         case 'awaiting_feedback':
             if ($text !== '') {
                 $userName = $msg['first_name'] ?? $msg['username'] ?? $userId;
-                $feedbackMsg = "📩 *ملاحظة جديدة من مستخدم*\n\n👤 الاسم: {$userName}\n🆔 المعرف: {$userId}\n📱 المنصة: {$platform}\n💬 الرسالة: {$text}\n🕐 الوقت: " . date('Y-m-d H:i:s');
-                if (ADMIN_CHAT_ID !== 'YOUR_ADMIN_ID') { sendTelegramMessage(ADMIN_CHAT_ID, $feedbackMsg, 'Markdown'); }
+                $feedbackMsg = "📩 *ملاحظة جديدة من مستخدم*\n\n"
+                    . "👤 الاسم: {$userName}\n"
+                    . "🆔 المعرف: {$userId}\n"
+                    . "📱 المنصة: {$platform}\n"
+                    . "💬 الرسالة: {$text}\n"
+                    . "🕐 الوقت: " . date('Y-m-d H:i:s');
+                if (ADMIN_CHAT_ID !== 'YOUR_ADMIN_ID') {
+                    sendTelegramMessage(ADMIN_CHAT_ID, $feedbackMsg, 'Markdown');
+                }
                 logMessage("Feedback from {$userId}: {$text}");
                 clearSession($db, $userId);
                 return getFormattedMessage($platform, "✅ تم إرسال ملاحظاتك بنجاح! شكراً لك. 💚\n\n" . buildMainMenuText($platform));
             }
             return getFormattedMessage($platform, "⚠️ لا يمكن إرسال رسالة فارغة. اكتب ملاحظتك أو /cancel للإلغاء.");
+
         case 'awaiting_broadcast':
-            if (!isAdmin($userId)) { clearSession($db, $userId); return getFormattedMessage($platform, "⛔ غير مصرح لك بهذا الأمر."); }
-            if ($text !== '') { $sent = broadcastMessage($db, $text); $db['stats']['broadcasts']++; clearSession($db, $userId); return getFormattedMessage($platform, "📢 تم بث الرسالة إلى {$sent} مستخدم بنجاح."); }
+            if (!isAdmin($userId)) {
+                clearSession($db, $userId);
+                return getFormattedMessage($platform, "⛔ غير مصرح لك بهذا الأمر.");
+            }
+            if ($text !== '') {
+                $sent = broadcastMessage($db, $text);
+                $db['stats']['broadcasts']++;
+                clearSession($db, $userId);
+                return getFormattedMessage($platform, "📢 تم بث الرسالة إلى {$sent} مستخدم بنجاح.");
+            }
             return getFormattedMessage($platform, "⚠️ لا يمكن بث رسالة فارغة. اكتب الرسالة أو /cancel للإلغاء.");
+
         case 'settings_menu':
             $choice = strtolower($text);
-            if (in_array($choice, ['1', 'lang_ar', 'arabic', 'العربية'])) { if (isset($db['users'][$userId])) { $db['users'][$userId]['language'] = 'ar'; } return getFormattedMessage($platform, "✅ تم تعيين اللغة إلى العربية.\n\n" . buildSettingsMessage($platform)); }
-            elseif (in_array($choice, ['2', 'lang_en', 'english', 'الإنجليزية'])) { if (isset($db['users'][$userId])) { $db['users'][$userId]['language'] = 'en'; } return getFormattedMessage($platform, "✅ Language set to English.\n\n" . buildSettingsMessage($platform)); }
-            elseif (in_array($choice, ['3', 'notif_on', 'إشعارات تشغيل'])) { if (isset($db['users'][$userId])) { $db['users'][$userId]['notifications'] = true; } return getFormattedMessage($platform, "✅ تم تفعيل الإشعارات.\n\n" . buildSettingsMessage($platform)); }
-            elseif (in_array($choice, ['4', 'notif_off', 'إشعارات إيقاف'])) { if (isset($db['users'][$userId])) { $db['users'][$userId]['notifications'] = false; } return getFormattedMessage($platform, "✅ تم إيقاف الإشعارات.\n\n" . buildSettingsMessage($platform)); }
+            if (in_array($choice, ['1', 'lang_ar', 'arabic', 'العربية'])) {
+                if (isset($db['users'][$userId])) { $db['users'][$userId]['language'] = 'ar'; }
+                return getFormattedMessage($platform, "✅ تم تعيين اللغة إلى العربية.\n\n" . buildSettingsMessage($platform));
+            } elseif (in_array($choice, ['2', 'lang_en', 'english', 'الإنجليزية'])) {
+                if (isset($db['users'][$userId])) { $db['users'][$userId]['language'] = 'en'; }
+                return getFormattedMessage($platform, "✅ Language set to English.\n\n" . buildSettingsMessage($platform));
+            } elseif (in_array($choice, ['3', 'notif_on', 'إشعارات تشغيل'])) {
+                if (isset($db['users'][$userId])) { $db['users'][$userId]['notifications'] = true; }
+                return getFormattedMessage($platform, "✅ تم تفعيل الإشعارات.\n\n" . buildSettingsMessage($platform));
+            } elseif (in_array($choice, ['4', 'notif_off', 'إشعارات إيقاف'])) {
+                if (isset($db['users'][$userId])) { $db['users'][$userId]['notifications'] = false; }
+                return getFormattedMessage($platform, "✅ تم إيقاف الإشعارات.\n\n" . buildSettingsMessage($platform));
+            }
             clearSession($db, $userId);
             return getFormattedMessage($platform, "✅ تم الخروج من الإعدادات.\n\n" . buildMainMenuText($platform));
-        default: clearSession($db, $userId); return null;
+
+        default:
+            clearSession($db, $userId);
+            return null;
     }
 }
+
+// ==================================================================
+// 7. MENU BUILDERS / بناء القوائم
+// ==================================================================
 
 function buildMainMenuText(string $platform): string
 {
     if ($platform === 'whatsapp') {
-        return "\n📋 *القائمة الرئيسية*\n\n1️⃣ المساعدة (/help)\n2️⃣ عن البوت (/about)\n3️⃣ الإعدادات (/settings)\n4️⃣ ملاحظات (/feedback)\n5️⃣ إلغاء (/cancel)\n";
+        return "\n📋 *القائمة الرئيسية*\n\n"
+            . "1️⃣ المساعدة (/help)\n"
+            . "2️⃣ عن البوت (/about)\n"
+            . "3️⃣ الإعدادات (/settings)\n"
+            . "4️⃣ ملاحظات (/feedback)\n"
+            . "5️⃣ إلغاء (/cancel)\n";
     }
-    return "📋 *القائمة الرئيسية*\nاستخدم الأزرار أدناه أو اكتب أمراً.";
+    return "📋 *القائمة الرئيسية*\n"
+        . "استخدم الأزرار أدناه أو اكتب أمراً.";
 }
 
 function buildMainMenuKeyboard(): array
 {
-    return ['inline_keyboard' => [
-        [['text' => '❓ مساعدة', 'callback_data' => 'menu_help'], ['text' => 'ℹ️ عن البوت', 'callback_data' => 'menu_about']],
-        [['text' => '⚙️ الإعدادات', 'callback_data' => 'menu_settings'], ['text' => '📝 ملاحظات', 'callback_data' => 'menu_feedback']],
-        [['text' => '✅ إلغاء', 'callback_data' => 'menu_cancel']],
-    ]];
+    return [
+        'inline_keyboard' => [
+            [
+                ['text' => '❓ مساعدة', 'callback_data' => 'menu_help'],
+                ['text' => 'ℹ️ عن البوت', 'callback_data' => 'menu_about'],
+            ],
+            [
+                ['text' => '⚙️ الإعدادات', 'callback_data' => 'menu_settings'],
+                ['text' => '📝 ملاحظات', 'callback_data' => 'menu_feedback'],
+            ],
+            [
+                ['text' => '✅ إلغاء', 'callback_data' => 'menu_cancel'],
+            ],
+        ],
+    ];
 }
 
 function buildSettingsKeyboard(): array
 {
-    return ['inline_keyboard' => [
-        [['text' => '🇸🇦 العربية', 'callback_data' => 'set_lang_ar'], ['text' => '🇬🇧 English', 'callback_data' => 'set_lang_en']],
-        [['text' => '🔔 تفعيل الإشعارات', 'callback_data' => 'set_notif_on'], ['text' => '🔕 إيقاف الإشعارات', 'callback_data' => 'set_notif_off']],
-        [['text' => '🔙 رجوع', 'callback_data' => 'menu_start']],
-    ]];
+    return [
+        'inline_keyboard' => [
+            [
+                ['text' => '🇸🇦 العربية', 'callback_data' => 'set_lang_ar'],
+                ['text' => '🇬🇧 English', 'callback_data' => 'set_lang_en'],
+            ],
+            [
+                ['text' => '🔔 تفعيل الإشعارات', 'callback_data' => 'set_notif_on'],
+                ['text' => '🔕 إيقاف الإشعارات', 'callback_data' => 'set_notif_off'],
+            ],
+            [
+                ['text' => '🔙 رجوع', 'callback_data' => 'menu_start'],
+            ],
+        ],
+    ];
 }
 
 function buildAdminKeyboard(): array
 {
-    return ['inline_keyboard' => [
-        [['text' => '📊 الإحصائيات', 'callback_data' => 'admin_stats'], ['text' => '👥 المستخدمين', 'callback_data' => 'admin_users']],
-        [['text' => '📜 السجلات', 'callback_data' => 'admin_logs'], ['text' => '📢 بث رسالة', 'callback_data' => 'menu_feedback']],
-        [['text' => '🔙 رجوع للقائمة', 'callback_data' => 'menu_start']],
-    ]];
+    return [
+        'inline_keyboard' => [
+            [
+                ['text' => '📊 الإحصائيات', 'callback_data' => 'admin_stats'],
+                ['text' => '👥 المستخدمين', 'callback_data' => 'admin_users'],
+            ],
+            [
+                ['text' => '📜 السجلات', 'callback_data' => 'admin_logs'],
+                ['text' => '📢 بث رسالة', 'callback_data' => 'menu_feedback'],
+            ],
+            [
+                ['text' => '🔙 رجوع للقائمة', 'callback_data' => 'menu_start'],
+            ],
+        ],
+    ];
 }
+
+// ==================================================================
+// 8. RESPONSE GENERATORS / مولدات الردود
+// ==================================================================
 
 function buildWelcomeMessage(array $msg): string
 {
     $name = $msg['first_name'] ?? $msg['username'] ?? 'صديقي';
     $platform = $msg['platform'];
-    $text = "🌟 *أهلاً وسهلاً بك يا {$name}!*\n\n🤖 أنا " . BOT_NAME . "، مساعدك الذكي.\nيمكنني مساعدتك في العديد من الأمور.\n\n📋 *إليك ما يمكنني فعله:*\n• الرد على أسئلتك وإرشادك\n• إدارة إعداداتك وتفضيلاتك\n• إرسال ملاحظاتك للمشرف\n• والكثير أكثر!\n\nاكتب /help لعرض جميع الأوامر أو استخدم القائمة أدناه.";
+    $text = "🌟 *أهلاً وسهلاً بك يا {$name}!*\n\n"
+        . "🤖 أنا " . BOT_NAME . "، مساعدك الذكي.\n"
+        . "يمكنني مساعدتك في العديد من الأمور.\n\n"
+        . "📋 *إليك ما يمكنني فعله:*\n"
+        . "• الرد على أسئلتك وإرشادك\n"
+        . "• إدارة إعداداتك وتفضيلاتك\n"
+        . "• إرسال ملاحظاتك للمشرف\n"
+        . "• والكثير أكثر!\n\n"
+        . "اكتب /help لعرض جميع الأوامر أو استخدم القائمة أدناه.";
     return getFormattedMessage($platform, $text);
 }
 
 function buildHelpMessage(string $platform): string
 {
-    $text = "📖 *دليل الاستخدام*\n\n*الأوامر المتاحة:*\n\n🚀 /start — بدء التحدث مع البوت\n❓ /help — عرض هذا الدليل\nℹ️ /about — معلومات عن البوت\n⚙️ /settings — إعدادات المستخدم\n📝 /feedback — إرسال ملاحظات للمشرف\n✅ /cancel — إلغاء العملية الحالية\n📋 /menu — عرض القائمة الرئيسية\n\n*أوامر المشرف:*\n🔧 /admin — لوحة المشرف\n📊 /stats — إحصائيات البوت\n📢 /broadcast — بث رسالة للجميع\n🚫 /ban [id] — حظر مستخدم\n✅ /unban [id] — رفع الحظر\n📜 /logs — عرض السجلات\n👥 /users — قائمة المستخدمين\n\n*ردود ذكية:*\n👋 قل «مرحبا» أو «hello» للترحيب\n👋 قل «مع السلامة» أو «bye» للوداع\n💚 قل «شكراً» أو «thanks» للشكر";
+    $text = "📖 *دليل الاستخدام*\n\n"
+        . "*الأوامر المتاحة:*\n\n"
+        . "🚀 /start — بدء التحدث مع البوت\n"
+        . "❓ /help — عرض هذا الدليل\n"
+        . "ℹ️ /about — معلومات عن البوت\n"
+        . "⚙️ /settings — إعدادات المستخدم\n"
+        . "📝 /feedback — إرسال ملاحظات للمشرف\n"
+        . "✅ /cancel — إلغاء العملية الحالية\n"
+        . "📋 /menu — عرض القائمة الرئيسية\n\n"
+        . "*أوامر المشرف:*\n"
+        . "🔧 /admin — لوحة المشرف\n"
+        . "📊 /stats — إحصائيات البوت\n"
+        . "📢 /broadcast — بث رسالة للجميع\n"
+        . "🚫 /ban [id] — حظر مستخدم\n"
+        . "✅ /unban [id] — رفع الحظر\n"
+        . "📜 /logs — عرض السجلات\n"
+        . "👥 /users — قائمة المستخدمين\n\n"
+        . "*ردود ذكية:*\n"
+        . "👋 قل «مرحبا» أو «hello» للترحيب\n"
+        . "👋 قل «مع السلامة» أو «bye» للوداع\n"
+        . "💚 قل «شكراً» أو «thanks» للشكر";
     return getFormattedMessage($platform, $text);
 }
 
 function buildAboutMessage(string $platform): string
 {
-    $text = "ℹ️ *عن البوت*\n\n🤖 *الاسم:* " . BOT_NAME . "\n📱 *المنصات:* تيليغرام + واتساب\n🌐 *اللغة:* العربية / الإنجليزية\n🔧 *الإصدار:* 1.0.0\n💎 *النوع:* مساعد ذكي متعدد المنصات\n\nالبوت يعمل بنظام Webhook لاستقبال الرسائل ومعالجتها فوراً.\nجميع البيانات محفوظة بأمان.";
+    $text = "ℹ️ *عن البوت*\n\n"
+        . "🤖 *الاسم:* " . BOT_NAME . "\n"
+        . "📱 *المنصات:* تيليغرام + واتساب\n"
+        . "🌐 *اللغة:* العربية / الإنجليزية\n"
+        . "🔧 *الإصدار:* 1.0.0\n"
+        . "💎 *النوع:* مساعد ذكي متعدد المنصات\n\n"
+        . "البوت يعمل بنظام Webhook لاستقبال الرسائل ومعالجتها فوراً.\n"
+        . "جميع البيانات محفوظة بأمان.";
     return getFormattedMessage($platform, $text);
 }
 
 function buildSettingsMessage(string $platform): string
 {
     if ($platform === 'whatsapp') {
-        return "⚙️ *الإعدادات*\n\n1️⃣ تعيين اللغة: العربية\n2️⃣ تعيين اللغة: English\n3️⃣ تفعيل الإشعارات\n4️⃣ إيقاف الإشعارات\n\nأرسل رقم الخيار أو /cancel للإلغاء.";
+        return "⚙️ *الإعدادات*\n\n"
+            . "1️⃣ تعيين اللغة: العربية\n"
+            . "2️⃣ تعيين اللغة: English\n"
+            . "3️⃣ تفعيل الإشعارات\n"
+            . "4️⃣ إيقاف الإشعارات\n\n"
+            . "أرسل رقم الخيار أو /cancel للإلغاء.";
     }
-    return "⚙️ *الإعدادات*\n\nاختر من الأزرار أدناه:";
+    return "⚙️ *الإعدادات*\n\n"
+        . "اختر من الأزرار أدناه:";
 }
 
 function buildAdminPanel(string $platform): string
 {
-    $text = "🔧 *لوحة المشرف*\n\n📊 /stats — إحصائيات البوت\n👥 /users — قائمة المستخدمين\n📢 /broadcast — بث رسالة\n🚫 /ban [id] — حظر مستخدم\n✅ /unban [id] — رفع الحظر\n📜 /logs — عرض السجلات";
+    $text = "🔧 *لوحة المشرف*\n\n"
+        . "📊 /stats — إحصائيات البوت\n"
+        . "👥 /users — قائمة المستخدمين\n"
+        . "📢 /broadcast — بث رسالة\n"
+        . "🚫 /ban [id] — حظر مستخدم\n"
+        . "✅ /unban [id] — رفع الحظر\n"
+        . "📜 /logs — عرض السجلات";
     return getFormattedMessage($platform, $text);
 }
 
@@ -483,17 +702,29 @@ function buildStatsMessage(array $db, string $platform): string
     $activeSessions = countActiveSessions($db);
     $broadcasts = $db['stats']['broadcasts'] ?? 0;
     $bannedCount = count($db['stats']['banned_users'] ?? []);
-    $text = "📊 *إحصائيات البوت*\n\n👥 إجمالي المستخدمين: *{$totalUsers}*\n💬 إجمالي الرسائل: *{$totalMessages}*\n🔄 إجمالي الجلسات: *{$totalSessions}*\n🟢 جلسات نشطة: *{$activeSessions}*\n📢 رسائل broadcast: *{$broadcasts}*\n🚫 مستخدمين محظورين: *{$bannedCount}*\n\n🕐 آخر تحديث: " . date('Y-m-d H:i:s');
+    $text = "📊 *إحصائيات البوت*\n\n"
+        . "👥 إجمالي المستخدمين: *{$totalUsers}*\n"
+        . "💬 إجمالي الرسائل: *{$totalMessages}*\n"
+        . "🔄 إجمالي الجلسات: *{$totalSessions}*\n"
+        . "🟢 جلسات نشطة: *{$activeSessions}*\n"
+        . "📢 رسائل broadcast: *{$broadcasts}*\n"
+        . "🚫 مستخدمين محظورين: *{$bannedCount}*\n\n"
+        . "🕐 آخر تحديث: " . date('Y-m-d H:i:s');
     return getFormattedMessage($platform, $text);
 }
 
 function buildUsersListMessage(array $db, string $platform): string
 {
-    if (empty($db['users'])) { return getFormattedMessage($platform, "👥 لا يوجد مستخدمون مسجلون بعد."); }
+    if (empty($db['users'])) {
+        return getFormattedMessage($platform, "👥 لا يوجد مستخدمون مسجلون بعد.");
+    }
     $text = "👥 *قائمة المستخدمين* (" . count($db['users']) . ")\n\n";
     $count = 0;
     foreach ($db['users'] as $user) {
-        if ($count >= 50) { $text .= "... و" . (count($db['users']) - 50) . " مستخدم آخر\n"; break; }
+        if ($count >= 50) {
+            $text .= "... و" . (count($db['users']) - 50) . " مستخدم آخر\n";
+            break;
+        }
         $name = $user['first_name'] ?? $user['username'] ?? 'غير معروف';
         $uid = $user['user_id'];
         $pf = $user['platform'] ?? '?';
@@ -506,20 +737,30 @@ function buildUsersListMessage(array $db, string $platform): string
 
 function buildLogsMessage(string $platform): string
 {
-    if (!file_exists(LOG_FILE)) { return getFormattedMessage($platform, "📜 لا توجد سجلات بعد."); }
+    if (!file_exists(LOG_FILE)) {
+        return getFormattedMessage($platform, "📜 لا توجد سجلات بعد.");
+    }
     $logs = file(LOG_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    if (!$logs || count($logs) === 0) { return getFormattedMessage($platform, "📜 لا توجد سجلات بعد."); }
+    if (!$logs || count($logs) === 0) {
+        return getFormattedMessage($platform, "📜 لا توجد سجلات بعد.");
+    }
     $recent = array_slice($logs, -20);
     $text = "📜 *آخر السجلات* (آخر 20)\n\n";
-    foreach ($recent as $line) { $text .= $line . "\n"; }
-    if (strlen($text) > 3500) { $text = substr($text, 0, 3500) . "\n... (مقتطع)"; }
+    foreach ($recent as $line) {
+        $text .= $line . "\n";
+    }
+    if (strlen($text) > 3500) {
+        $text = substr($text, 0, 3500) . "\n... (مقتطع)";
+    }
     return getFormattedMessage($platform, $text);
 }
 
 function getFallbackMessage(array $msg): string
 {
     $name = $msg['first_name'] ?? 'صديقي';
-    return "🤔 عذراً، لم أفهم \"$msg[text]\".\n\nيمكنك كتابة /help لعرض جميع الأوامر المتاحة.\nأو استخدم القائمة أدناه للتنقل.";
+    return "🤔 عذراً، لم أفهم \"$msg[text]\".\n\n"
+        . "يمكنك كتابة /help لعرض جميع الأوامر المتاحة.\n"
+        . "أو استخدم القائمة أدناه للتنقل.";
 }
 
 function getFormattedMessage(string $platform, string $text): string
@@ -527,24 +768,46 @@ function getFormattedMessage(string $platform, string $text): string
     return $text;
 }
 
+// ==================================================================
+// 9. ADMIN FUNCTIONS / وظائف المشرف
+// ==================================================================
+
 function isAdmin(string $userId): bool
 {
-    if (ADMIN_CHAT_ID === 'YOUR_ADMIN_ID' || ADMIN_CHAT_ID === '') { return false; }
+    if (ADMIN_CHAT_ID === 'YOUR_ADMIN_ID' || ADMIN_CHAT_ID === '') {
+        return false;
+    }
     return (string)$userId === (string)ADMIN_CHAT_ID;
 }
 
 function banUser(array &$db, string $targetId, string $platform): string
 {
-    if (isset($db['users'][$targetId])) { $db['users'][$targetId]['is_banned'] = true; }
-    if (!in_array($targetId, $db['stats']['banned_users'])) { $db['stats']['banned_users'][] = $targetId; }
+    if (isset($db['users'][$targetId])) {
+        $db['users'][$targetId]['is_banned'] = true;
+    } else {
+        $db['users'][$targetId] = [
+            'user_id' => $targetId, 'platform' => 'telegram',
+            'username' => '', 'first_name' => '', 'last_name' => '',
+            'language' => BOT_LANGUAGE, 'notifications' => true,
+            'joined_at' => date('Y-m-d H:i:s'), 'last_seen' => date('Y-m-d H:i:s'),
+            'message_count' => 0, 'is_banned' => true,
+        ];
+    }
+    if (!in_array($targetId, $db['stats']['banned_users'])) {
+        $db['stats']['banned_users'][] = $targetId;
+    }
     logMessage("User {$targetId} banned by admin");
     return getFormattedMessage($platform, "🚫 تم حظر المستخدم {$targetId} بنجاح.");
 }
 
 function unbanUser(array &$db, string $targetId, string $platform): string
 {
-    if (isset($db['users'][$targetId])) { $db['users'][$targetId]['is_banned'] = false; }
-    $db['stats']['banned_users'] = array_values(array_filter($db['stats']['banned_users'], fn($id) => $id !== $targetId));
+    if (isset($db['users'][$targetId])) {
+        $db['users'][$targetId]['is_banned'] = false;
+    }
+    $db['stats']['banned_users'] = array_values(
+        array_filter($db['stats']['banned_users'], fn($id) => $id !== $targetId)
+    );
     logMessage("User {$targetId} unbanned by admin");
     return getFormattedMessage($platform, "✅ تم رفع الحظر عن المستخدم {$targetId} بنجاح.");
 }
@@ -553,24 +816,40 @@ function broadcastMessage(array $db, string $message): int
 {
     $sent = 0;
     foreach ($db['users'] as $user) {
-        if ($user['is_banned'] ?? false) { continue; }
+        if ($user['is_banned'] ?? false) {
+            continue;
+        }
         $chatId = $user['user_id'];
         $pf = $user['platform'] ?? 'telegram';
         $fullMsg = "📢 *رسالة من المشرف*\n\n" . $message;
-        if ($pf === 'telegram') { $result = sendTelegramMessage($chatId, $fullMsg, 'Markdown'); if ($result) $sent++; }
-        elseif ($pf === 'whatsapp') { $result = sendWhatsAppMessage($chatId, $fullMsg); if ($result) $sent++; }
+        if ($pf === 'telegram') {
+            $result = sendTelegramMessage($chatId, $fullMsg, 'Markdown');
+            if ($result) $sent++;
+        } elseif ($pf === 'whatsapp') {
+            $result = sendWhatsAppMessage($chatId, $fullMsg);
+            if ($result) $sent++;
+        }
     }
     logMessage("Broadcast sent to {$sent} users");
     return $sent;
 }
 
+// ==================================================================
+// 10. UTILITY FUNCTIONS / الوظائف المساعدة
+// ==================================================================
+
 function sendTelegramMessage(string $chatId, string $text, string $parseMode = 'Markdown', ?array $replyMarkup = null): bool
 {
     $params = ['chat_id' => $chatId, 'text' => $text, 'parse_mode' => $parseMode];
-    if ($replyMarkup !== null) { $params['reply_markup'] = json_encode($replyMarkup); }
+    if ($replyMarkup !== null) {
+        $params['reply_markup'] = json_encode($replyMarkup);
+    }
     $url = TELEGRAM_API_URL . '/sendMessage';
     $result = httpRequest($url, 'POST', $params);
-    if ($result === false) { logError("Telegram sendMessage failed for chat_id={$chatId}"); return false; }
+    if ($result === false) {
+        logError("Telegram sendMessage failed for chat_id={$chatId}");
+        return false;
+    }
     $decoded = json_decode($result, true);
     return ($decoded['ok'] ?? false) === true;
 }
@@ -583,11 +862,17 @@ function answerCallbackQuery(string $callbackId): void
 
 function sendWhatsAppMessage(string $chatId, string $text): bool
 {
-    if (WHATSAPP_API_KEY === 'YOUR_API_KEY_HERE' || WHATSAPP_INSTANCE_ID === 'YOUR_INSTANCE_ID') { logError("WhatsApp API not configured — cannot send to {$chatId}"); return false; }
+    if (WHATSAPP_API_KEY === 'YOUR_API_KEY_HERE' || WHATSAPP_INSTANCE_ID === 'YOUR_INSTANCE_ID') {
+        logError("WhatsApp API not configured — cannot send to {$chatId}");
+        return false;
+    }
     $url = WHATSAPP_API_URL . '/' . WHATSAPP_INSTANCE_ID . '/messages/chat';
     $params = ['token' => WHATSAPP_API_KEY, 'to' => $chatId, 'body' => $text];
     $result = httpRequest($url, 'POST', $params);
-    if ($result === false) { logError("WhatsApp sendMessage failed for chat_id={$chatId}"); return false; }
+    if ($result === false) {
+        logError("WhatsApp sendMessage failed for chat_id={$chatId}");
+        return false;
+    }
     $decoded = json_decode($result, true);
     return ($decoded['sent'] ?? $decoded['ok'] ?? false) !== false;
 }
@@ -596,7 +881,9 @@ function httpRequest(string $url, string $method = 'GET', array $params = [])
 {
     $method = strtoupper($method);
     $queryString = http_build_query($params);
-    if ($method === 'GET' && !empty($params)) { $url .= (strpos($url, '?') !== false ? '&' : '?') . $queryString; }
+    if ($method === 'GET' && !empty($params)) {
+        $url .= (strpos($url, '?') !== false ? '&' : '?') . $queryString;
+    }
     if (function_exists('curl_init')) {
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $url);
@@ -605,20 +892,40 @@ function httpRequest(string $url, string $method = 'GET', array $params = [])
         curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
-        if ($method === 'POST') { curl_setopt($ch, CURLOPT_POST, true); curl_setopt($ch, CURLOPT_POSTFIELDS, $queryString); curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/x-www-form-urlencoded']); }
+        if ($method === 'POST') {
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $queryString);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/x-www-form-urlencoded']);
+        }
         $response = curl_exec($ch);
         $error = curl_error($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-        if ($response === false) { logError("cURL error: {$error} | URL: {$url}"); return false; }
-        if ($httpCode >= 400) { logError("HTTP {$httpCode} from URL: {$url} | Response: " . substr((string)$response, 0, 500)); }
+        if ($response === false) {
+            logError("cURL error: {$error} | URL: {$url}");
+            return false;
+        }
+        if ($httpCode >= 400) {
+            logError("HTTP {$httpCode} from URL: {$url} | Response: " . substr((string)$response, 0, 500));
+        }
         return $response;
     }
-    $opts = ['http' => ['method' => $method, 'timeout' => 30, 'header' => "Content-Type: application/x-www-form-urlencoded\r\n", 'ignore_errors' => true]];
-    if ($method === 'POST') { $opts['http']['content'] = $queryString; }
+    $opts = [
+        'http' => [
+            'method' => $method, 'timeout' => 30,
+            'header' => "Content-Type: application/x-www-form-urlencoded\r\n",
+            'ignore_errors' => true,
+        ],
+    ];
+    if ($method === 'POST') {
+        $opts['http']['content'] = $queryString;
+    }
     $context = stream_context_create($opts);
     $response = @file_get_contents($url, false, $context);
-    if ($response === false) { logError("Stream request failed for URL: {$url}"); return false; }
+    if ($response === false) {
+        logError("Stream request failed for URL: {$url}");
+        return false;
+    }
     return $response;
 }
 
@@ -638,37 +945,67 @@ function logError(string $message): void
 function appendLog(string $entry): void
 {
     $existing = [];
-    if (file_exists(LOG_FILE)) { $existing = file(LOG_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES); if ($existing === false) { $existing = []; } }
+    if (file_exists(LOG_FILE)) {
+        $existing = file(LOG_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($existing === false) {
+            $existing = [];
+        }
+    }
     $existing[] = $entry;
-    if (count($existing) > LOG_MAX_ENTRIES) { $existing = array_slice($existing, -LOG_MAX_ENTRIES); }
+    if (count($existing) > LOG_MAX_ENTRIES) {
+        $existing = array_slice($existing, -LOG_MAX_ENTRIES);
+    }
     $fp = fopen(LOG_FILE, 'c');
-    if ($fp === false) { return; }
-    if (flock($fp, LOCK_EX)) { ftruncate($fp, 0); rewind($fp); fwrite($fp, implode("\n", $existing) . "\n"); fflush($fp); flock($fp, LOCK_UN); }
+    if ($fp === false) {
+        return;
+    }
+    if (flock($fp, LOCK_EX)) {
+        ftruncate($fp, 0);
+        rewind($fp);
+        fwrite($fp, implode("\n", $existing) . "\n");
+        fflush($fp);
+        flock($fp, LOCK_UN);
+    }
     fclose($fp);
 }
 
 function sanitizeInput(string $input, int $maxLength = 4096): string
 {
     $input = trim($input);
-    if (strlen($input) > $maxLength) { $input = substr($input, 0, $maxLength); }
+    if (strlen($input) > $maxLength) {
+        $input = substr($input, 0, $maxLength);
+    }
     $input = str_replace(["\0", "\r"], '', $input);
     return $input;
 }
 
+// ==================================================================
+// 11. SECURITY FUNCTIONS / وظائف الأمان
+// ==================================================================
+
 function isUserBanned(array $db, string $userId): bool
 {
-    if (isset($db['users'][$userId]['is_banned']) && $db['users'][$userId]['is_banned']) { return true; }
-    if (in_array($userId, $db['stats']['banned_users'] ?? [])) { return true; }
+    if (isset($db['users'][$userId]['is_banned']) && $db['users'][$userId]['is_banned']) {
+        return true;
+    }
+    if (in_array($userId, $db['stats']['banned_users'] ?? [])) {
+        return true;
+    }
     return false;
 }
 
 function checkRateLimit(array &$db, string $userId): bool
 {
     $now = time();
-    if (!isset($db['sessions'][$userId]['rate_limit'])) { $db['sessions'][$userId]['rate_limit'] = []; }
+    if (!isset($db['sessions'][$userId]['rate_limit'])) {
+        $db['sessions'][$userId]['rate_limit'] = [];
+    }
     $timestamps = $db['sessions'][$userId]['rate_limit'];
     $timestamps = array_filter($timestamps, fn($t) => ($now - $t) < RATE_LIMIT_WINDOW);
-    if (count($timestamps) >= RATE_LIMIT_MAX) { $db['sessions'][$userId]['rate_limit'] = array_values($timestamps); return false; }
+    if (count($timestamps) >= RATE_LIMIT_MAX) {
+        $db['sessions'][$userId]['rate_limit'] = array_values($timestamps);
+        return false;
+    }
     $timestamps[] = $now;
     $db['sessions'][$userId]['rate_limit'] = array_values($timestamps);
     return true;
@@ -676,20 +1013,71 @@ function checkRateLimit(array &$db, string $userId): bool
 
 function detectIntent(string $text): ?string
 {
-    $lower = strtolower($text);
-    $arabicLower = $text;
-    $greetings = ['مرحبا', 'مرحباً', 'مرحبتين', 'هلا', 'هاي', 'اهلا', 'أهلا', 'أهلاً', 'السلام عليكم', 'سلام', 'hi', 'hello', 'hey', 'hii', 'yo', 'good morning', 'good evening', 'صباح الخير', 'مساء الخير'];
-    foreach ($greetings as $g) { if (str_contains($lower, strtolower($g)) || str_contains($arabicLower, $g)) { return 'greeting'; } }
+    $lower = ' ' . strtolower($text) . ' ';
+
+    $match = function(string $needle) use ($lower): bool {
+        $needle = strtolower($needle);
+        $pos = stripos($lower, $needle);
+        if ($pos === false) {
+            return false;
+        }
+        $len = strlen($needle);
+        $end = $pos + $len;
+        $before = $pos > 0 ? substr($lower, $pos - 1, 1) : ' ';
+        $after = substr($lower, $end, 1);
+        $isWordChar = function(string $ch): bool {
+            if ($ch === '' || $ch === ' ') return false;
+            $code = ord($ch);
+            if (($code >= 48 && $code <= 57) || ($code >= 65 && $code <= 90) || ($code >= 97 && $code <= 122) || $code === 95) {
+                return true;
+            }
+            return $code > 127;
+        };
+        return !$isWordChar($before) && !$isWordChar($after);
+    };
+
     $farewells = ['مع السلامة', 'مع السلامه', 'باي', 'bye', 'goodbye', 'see you', 'وداعا', 'وداعاً', 'تصبح على خير', 'good night', 'لالقاء'];
-    foreach ($farewells as $f) { if (str_contains($lower, strtolower($f)) || str_contains($arabicLower, $f)) { return 'farewell'; } }
+    foreach ($farewells as $f) {
+        if ($match($f)) {
+            return 'farewell';
+        }
+    }
+
     $thanks = ['شكرا', 'شكراً', 'مشكور', 'ممتاز', 'thanks', 'thank you', 'thx', 'ty', 'appreciate', 'thanks a lot', 'ممنون', 'جزاك الله'];
-    foreach ($thanks as $t) { if (str_contains($lower, strtolower($t)) || str_contains($arabicLower, $t)) { return 'thanks'; } }
+    foreach ($thanks as $t) {
+        if ($match($t)) {
+            return 'thanks';
+        }
+    }
+
+    $greetings = ['مرحبا', 'مرحباً', 'مرحبتين', 'هلا', 'هاي', 'اهلا', 'أهلا', 'أهلاً', 'السلام عليكم', 'سلام', 'hi', 'hello', 'hey', 'hii', 'yo', 'good morning', 'good evening', 'صباح الخير', 'مساء الخير'];
+    foreach ($greetings as $g) {
+        if ($match($g)) {
+            return 'greeting';
+        }
+    }
+
     $howAreYou = ['كيف حالك', 'كيفك', 'شخبارك', 'اخبارك', 'how are you', 'how r u', 'how do you do'];
-    foreach ($howAreYou as $h) { if (str_contains($lower, strtolower($h)) || str_contains($arabicLower, $h)) { return 'how_are_you'; } }
+    foreach ($howAreYou as $h) {
+        if ($match($h)) {
+            return 'how_are_you';
+        }
+    }
+
     $capabilities = ['ماذا تستطيع', 'ماذا تفعل', 'وش تسوي', 'what can you do', 'what do you do', 'who are you', 'من انت', 'من أنت', 'عرف نفسك'];
-    foreach ($capabilities as $c) { if (str_contains($lower, strtolower($c)) || str_contains($arabicLower, $c)) { return 'capabilities'; } }
+    foreach ($capabilities as $c) {
+        if ($match($c)) {
+            return 'capabilities';
+        }
+    }
+
     $love = ['احبك', 'أحبك', 'انت رائع', 'أنت رائع', 'i love you', 'you are great', 'you are awesome', 'مبدع', 'ابداع'];
-    foreach ($love as $l) { if (str_contains($lower, strtolower($l)) || str_contains($arabicLower, $l)) { return 'compliment'; } }
+    foreach ($love as $l) {
+        if ($match($l)) {
+            return 'compliment';
+        }
+    }
+
     return null;
 }
 
@@ -697,73 +1085,140 @@ function handleIntent(string $intent, array $msg, array $db): string
 {
     $platform = $msg['platform'];
     $name = $msg['first_name'] ?? $msg['username'] ?? 'صديقي';
+
     switch ($intent) {
         case 'greeting':
             $hour = (int)date('H');
             $greeting = $hour < 12 ? "صباح الخير" : "مساء الخير";
-            return getFormattedMessage($platform, "👋 {$greeting} يا {$name}! 🌟\n\nأنا " . BOT_NAME . ". كيف يمكنني مساعدتك اليوم؟\nاكتب /help لعرض الأوامر المتاحة.");
+            return getFormattedMessage($platform, "👋 {$greeting} يا {$name}! 🌟\n\n"
+                . "أنا " . BOT_NAME . ". كيف يمكنني مساعدتك اليوم؟\n"
+                . "اكتب /help لعرض الأوامر المتاحة.");
         case 'farewell':
-            return getFormattedMessage($platform, "👋 مع السلامة يا {$name}! 🌟\n\nكنت سعيداً بالتحدث معك.\nعود في أي وقت! 💚");
+            return getFormattedMessage($platform, "👋 مع السلامة يا {$name}! 🌟\n\n"
+                . "كنت سعيداً بالتحدث معك.\n"
+                . "عود في أي وقت! 💚");
         case 'thanks':
-            return getFormattedMessage($platform, "💚 العفو يا {$name}! سعيد بخدمتك دائماً.\n\nهل تحتاج مساعدة في شيء آخر؟");
+            return getFormattedMessage($platform, "💚 العفو يا {$name}! سعيد بخدمتك دائماً.\n\n"
+                . "هل تحتاج مساعدة في شيء آخر؟");
         case 'how_are_you':
-            return getFormattedMessage($platform, "😊 أنا بخير والحمد لله! 🤖\n\nأعمل بكفاءة عالية وجاهز لمساعدتك.\nكيف حالك أنت يا {$name}؟");
+            return getFormattedMessage($platform, "😊 أنا بخير والحمد لله! 🤖\n\n"
+                . "أعمل بكفاءة عالية وجاهز لمساعدتك.\n"
+                . "كيف حالك أنت يا {$name}؟");
         case 'capabilities':
-            return getFormattedMessage($platform, "🤖 أنا " . BOT_NAME . "!\n\n*إليك ما أستطيع فعله:*\n• الرد على رسائلك بذكاء\n• توفير قوائم تفاعلية للتنقل\n• إدارة إعداداتك وتفضيلاتك\n• استقبال ملاحظاتك وإرسالها للمشرف\n• العمل على تيليغرام وواتساب معاً\n\nاكتب /help لعرض جميع الأوامر.");
+            return getFormattedMessage($platform, "🤖 أنا " . BOT_NAME . "!\n\n"
+                . "*إليك ما أستطيع فعله:*\n"
+                . "• الرد على رسائلك بذكاء\n"
+                . "• توفير قوائم تفاعلية للتنقل\n"
+                . "• إدارة إعداداتك وتفضيلاتك\n"
+                . "• استقبال ملاحظاتك وإرسالها للمشرف\n"
+                . "• العمل على تيليغرام وواتساب معاً\n\n"
+                . "اكتب /help لعرض جميع الأوامر.");
         case 'compliment':
-            return getFormattedMessage($platform, "😊 شكراً جزيلاً يا {$name}! 🌟\n\nممتن لكلماتك الطيبة. أنا هنا دائماً لمساعدتك! 💚");
+            return getFormattedMessage($platform, "😊 شكراً جزيلاً يا {$name}! 🌟\n\n"
+                . "ممتن لكلماتك الطيبة. أنا هنا دائماً لمساعدتك! 💚");
         default:
             return getFormattedMessage($platform, getFallbackMessage($msg));
     }
 }
 
+// ==================================================================
+// 12. MAIN EXECUTION ENTRY POINT / نقطة التنفيذ الرئيسية
+// ==================================================================
+
 function main(): void
 {
     respond200('OK');
-    if (!validateWebhookSecret()) { logError('Webhook secret validation failed'); return; }
+
+    if (!validateWebhookSecret()) {
+        logError('Webhook secret validation failed');
+        return;
+    }
+
     $payload = readIncomingPayload();
-    if ($payload === null) { return; }
+    if ($payload === null) {
+        return;
+    }
+
     $platform = detectPlatform();
     logMessage("Incoming webhook from platform: {$platform}");
+
     $msg = parseMessage($payload, $platform);
-    if ($msg === null) { logMessage("No parseable message found in payload"); return; }
+    if ($msg === null) {
+        logMessage("No parseable message found in payload");
+        return;
+    }
+
     $msg['text'] = sanitizeInput($msg['text'] ?? '');
+
     $userId = $msg['user_id'];
     $chatId = $msg['chat_id'];
     $platform = $msg['platform'];
-    if (empty($userId) || $userId === '0') { logError("Invalid user ID in message"); return; }
+
+    if (empty($userId) || $userId === '0') {
+        logError("Invalid user ID in message");
+        return;
+    }
+
     $db = loadDB();
+
     if (isUserBanned($db, $userId)) {
         logMessage("Banned user {$userId} attempted to send message");
-        if ($platform === 'telegram') { sendTelegramMessage($chatId, "🚫 تم حظرك من استخدام هذا البوت. للاستفسار، تواصل مع المشرف."); }
-        elseif ($platform === 'whatsapp') { sendWhatsAppMessage($chatId, "🚫 تم حظرك من استخدام هذا البوت. للاستعلام، تواصل مع المشرف."); }
-        saveDB($db); return;
+        if ($platform === 'telegram') {
+            sendTelegramMessage($chatId, "🚫 تم حظرك من استخدام هذا البوت. للاستفسار، تواصل مع المشرف.");
+        } elseif ($platform === 'whatsapp') {
+            sendWhatsAppMessage($chatId, "🚫 تم حظرك من استخدام هذا البوت. للاستعلام، تواصل مع المشرف.");
+        }
+        saveDB($db);
+        return;
     }
+
     if (!checkRateLimit($db, $userId)) {
         logMessage("Rate limit exceeded for user {$userId}");
-        if ($platform === 'telegram') { sendTelegramMessage($chatId, "⚠️ لقد أرسلت رسائل كثيرة جداً. يرجى الانتظار دقيقة قبل المحاولة مرة أخرى."); }
-        elseif ($platform === 'whatsapp') { sendWhatsAppMessage($chatId, "⚠️ لقد أرسلت رسائل كثيرة جداً. يرجى الانتظار دقيقة قبل المحاولة مرة أخرى."); }
-        saveDB($db); return;
+        if ($platform === 'telegram') {
+            sendTelegramMessage($chatId, "⚠️ لقد أرسلت رسائل كثيرة جداً. يرجى الانتظار دقيقة قبل المحاولة مرة أخرى.");
+        } elseif ($platform === 'whatsapp') {
+            sendWhatsAppMessage($chatId, "⚠️ لقد أرسلت رسائل كثيرة جداً. يرجى الانتظار دقيقة قبل المحاولة مرة أخرى.");
+        }
+        saveDB($db);
+        return;
     }
+
     registerUser($db, $msg);
+
     $displayName = $msg['first_name'] ?? $msg['username'] ?? $userId;
     $textPreview = substr($msg['text'] ?? '', 0, 100);
     logMessage("Message from {$displayName} ({$userId}) [{$platform}]: {$textPreview}");
+
     try {
         $response = handleCommand($msg, $db);
+
         if ($response !== null) {
             if ($platform === 'telegram') {
                 $keyboard = null;
                 if (str_contains($msg['text'] ?? '', '/start') || str_contains($msg['text'] ?? '', '/menu') || !empty($msg['is_callback'])) {
-                    if (str_contains($response, 'الإعدادات') && str_contains($response, 'اختر من الأزرار')) { $keyboard = buildSettingsKeyboard(); }
-                    elseif (str_contains($response, 'لوحة المشرف')) { $keyboard = buildAdminKeyboard(); }
-                    else { $keyboard = buildMainMenuKeyboard(); }
+                    if (str_contains($response, 'الإعدادات') && str_contains($response, 'اختر من الأزرار')) {
+                        $keyboard = buildSettingsKeyboard();
+                    } elseif (str_contains($response, 'لوحة المشرف')) {
+                        $keyboard = buildAdminKeyboard();
+                    } else {
+                        $keyboard = buildMainMenuKeyboard();
+                    }
                 }
-                if (str_contains($msg['text'] ?? '', '/settings')) { $keyboard = buildSettingsKeyboard(); }
-                if (str_contains($msg['text'] ?? '', '/admin') && isAdmin($userId)) { $keyboard = buildAdminKeyboard(); }
-                if (str_contains($response, 'لم أفهم') || str_contains($response, 'لم أتمكن')) { $keyboard = buildMainMenuKeyboard(); }
-                if (str_contains($response, 'أهلاً وسهلاً')) { $keyboard = buildMainMenuKeyboard(); }
-                if (str_contains($response, 'القائمة الرئيسية')) { $keyboard = buildMainMenuKeyboard(); }
+                if (str_contains($msg['text'] ?? '', '/settings')) {
+                    $keyboard = buildSettingsKeyboard();
+                }
+                if (str_contains($msg['text'] ?? '', '/admin') && isAdmin($userId)) {
+                    $keyboard = buildAdminKeyboard();
+                }
+                if (str_contains($response, 'لم أفهم') || str_contains($response, 'لم أتمكن')) {
+                    $keyboard = buildMainMenuKeyboard();
+                }
+                if (str_contains($response, 'أهلاً وسهلاً')) {
+                    $keyboard = buildMainMenuKeyboard();
+                }
+                if (str_contains($response, 'القائمة الرئيسية')) {
+                    $keyboard = buildMainMenuKeyboard();
+                }
                 sendTelegramMessage($chatId, $response, 'Markdown', $keyboard);
             } elseif ($platform === 'whatsapp') {
                 sendWhatsAppMessage($chatId, $response);
@@ -771,9 +1226,13 @@ function main(): void
         }
     } catch (Throwable $e) {
         logError("Exception in handleCommand: " . $e->getMessage() . " | File: " . $e->getFile() . ":" . $e->getLine());
-        if ($platform === 'telegram') { sendTelegramMessage($chatId, "⚠️ حدث خطأ أثناء معالجة طلبك. يرجى المحاولة مرة أخرى أو كتابة /start."); }
-        elseif ($platform === 'whatsapp') { sendWhatsAppMessage($chatId, "⚠️ حدث خطأ أثناء معالجة طلبك. يرجى المحاولة مرة أخرى."); }
+        if ($platform === 'telegram') {
+            sendTelegramMessage($chatId, "⚠️ حدث خطأ أثناء معالجة طلبك. يرجى المحاولة مرة أخرى أو كتابة /start.");
+        } elseif ($platform === 'whatsapp') {
+            sendWhatsAppMessage($chatId, "⚠️ حدث خطأ أثناء معالجة طلبك. يرجى المحاولة مرة أخرى.");
+        }
     }
+
     saveDB($db);
 }
 
